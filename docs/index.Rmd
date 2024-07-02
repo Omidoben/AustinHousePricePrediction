@@ -1,0 +1,402 @@
+---
+title: "Austin House Price Prediction Using an XGBoost Model"
+author: "Benard Omido"
+date: "2024-07-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+```
+
+
+```{r}
+austin <- read_csv("austinHousingData.csv")
+austin
+```
+
+```{r}
+glimpse(austin)
+```
+
+**Explore the data**
+
+```{r}
+library(DataExplorer)
+
+plot_intro(austin)
+
+# There are a few missing rows in the data
+```
+
+```{r, echo=FALSE}
+# The missing rows are in the LatestPriceSource column
+
+colSums(is.na(austin))
+```
+
+**Drop columns that won't be used in the analysis**
+
+```{r}
+# Garage spaces is removed because it is a duplicate of the parking space column
+
+austin_df <- austin %>% 
+  select(-c(latestPriceSource, latest_saleyear, 
+            latest_salemonth, latest_saledate, numPriceChanges, garageSpaces,                      streetAddress, city)) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate_if(is.logical, factor)
+
+austin_df
+```
+
+**Average House prices by the zip code**
+
+```{r}
+austin_df %>% 
+  group_by(zipcode) %>% 
+  summarize(avg_price = mean(latestPrice)) %>% 
+  slice_max(avg_price, n = 15) %>% 
+  mutate(zipcode = as.factor(zipcode)) %>% 
+  ggplot(aes(avg_price, fct_reorder(zipcode, avg_price), 
+             color = avg_price)) +
+  geom_point(size = 5) +
+  geom_segment(aes(xend = 581110, yend = zipcode), linewidth = 2) +
+  scale_x_continuous(expand = c(0,0), limits = c(581110, 1440000), 
+                     position = "top", labels = scales::dollar) +
+  scale_color_gradient(low = "steelblue", high = "red") +
+  labs(y = "Zip Code",
+       x = NULL,
+       title = "Average House Price By Zip Code (Top 15)",
+       caption = "Source: kaggle") +
+  theme_classic() +
+  theme(axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text = element_text(color = "black"),
+        plot.title = element_text(size = 12, color = "black", face = "bold"),
+        legend.position = "none")
+```
+
+**Distribution of house prices in Austin**
+
+```{r}
+austin_df %>% 
+  ggplot(aes(latestPrice)) +
+  geom_histogram(bins = 50, fill = "midnightblue", color = "white") +
+  scale_x_log10() +
+  labs(x = "Latest Price", y = "Frequency", title = "Distribution of House Prices") +
+  theme_minimal()+
+  theme(axis.text = element_text(color = "black"),
+        plot.title = element_text(colour = "black", face = "bold"))
+
+# The house prices are right skewed, with a few large values, thus the need to use log   to transform the x axis. (Spreads out the small values and compresses the large ones)
+
+```
+
+Majority of the houses in Austin are priced at approximately $500,000
+
+**Distribution of House Price By location (latitude & longitude)**
+
+```{r}
+price_plot <- austin_df %>% 
+  ggplot(aes(latitude, longitude, z = log(latestPrice))) +
+  stat_summary_hex(alpha = 0.8, bins = 40) +
+  scale_fill_viridis_c() +
+  labs(fill = "mean", title = "Price") +
+  theme(axis.text = element_text(color = "black"),
+        plot.title = element_text(colour = "black", face = "bold"))
+
+price_plot
+
+```
+
+The central areas of Austin show higher mean log-transformed house prices, as indicated by brighter colors on the map.
+
+This suggests that actual house prices are significantly higher in the city center. For instance, if the mean log price in these areas is around 4, this corresponds to an actual price of approximately exp(4) = 54.60
+
+Areas farther from the city center exhibit lower mean log-transformed house prices, shown by darker colors.
+
+
+
+```{r}
+# Distribution of House prices, year Built, lot Size, and average school ratings
+library(patchwork)
+
+austin_plot <- function(var, title){
+  austin_df %>% 
+  ggplot(aes(latitude, longitude, z = {{var}})) +
+    stat_summary_hex(alpha = 0.8, bins = 40) +
+    scale_fill_viridis_c() +
+    labs(fill = "mean", title = title) +
+    theme(axis.text = element_text(color = "black"),
+          plot.title = element_text(colour = "black", face = "bold"))
+}
+
+(price_plot + austin_plot(yearBuilt, "Year Built")) / 
+  (austin_plot(log10(lotSizeSqFt), "Lot Size (log)") + austin_plot(avgSchoolRating, "Average School Rating"))
+```
+
+Majority of the recent houses and those with large lot sizes are farther away from the center of the city
+
+### **Build the model**
+
+```{r}
+austin_df <- austin_df %>% 
+  mutate(latestPrice = log10(latestPrice))
+
+# Create training and test data sets
+
+set.seed(123)
+
+austin_splits <- initial_split(austin_df)
+
+austin_train <- training(austin_splits)
+austin_train
+
+austin_test <- testing(austin_splits)
+austin_test
+
+```
+
+```{r}
+# Create cross validation folds
+
+set.seed(234)
+
+austin_folds <- vfold_cv(austin_train, v = 10)
+austin_folds
+
+```
+
+**Create a recipe**
+
+```{r}
+# First check for correlation
+
+numeric_vars <- austin_df %>% 
+  select(where(is.numeric), -c(zpid, zipcode, latitude, longitude, 
+                               parkingSpaces, starts_with("num")))
+
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+library(ggcorrplot)
+
+ggcorrplot(cor_matrix, method = "square", 
+           type = "full", 
+           lab = TRUE, 
+           lab_size = 3, 
+           tl.cex = 10)
+```
+
+There are no highly correlated values in the data. Highest correlation = 0.73, which is between median students per teacher
+and average school rating
+
+
+```{r}
+austin_rec <- recipe(latestPrice ~ ., data = austin_train) %>% 
+  update_role(zpid, new_role = "ID") %>%
+  update_role(zipcode, new_role = "zip") %>%
+  step_rm(hasAssociation, hasCooling, hasHeating, hasView, hasGarage,
+          numOfPhotos, numOfAccessibilityFeatures, numOfAppliances, 
+          numOfPatioAndPorchFeatures, numOfSecurityFeatures, numOfWaterfrontFeatures,
+          numOfWindowFeatures, numOfCommunityFeatures, numOfPrimarySchools, numOfElementarySchools,
+          numOfMiddleSchools, numOfHighSchools, numOfStories, avgSchoolSize, avgSchoolDistance) %>% 
+
+#This columns are removed because they don't add significant value to the model
+
+  step_other(homeType, threshold = 0.01) %>% 
+  step_log(lotSizeSqFt, base = 10) %>% 
+  #step_ns(latitude, longitude, deg_free = 30) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_predictors()) 
+
+austin_rec
+```
+
+```{r}
+austin_prep <- prep(austin_rec)
+austin_prep
+
+bake(austin_prep, new_data = NULL)
+```
+
+Build an XGBoost model
+
+```{r}
+xgb_spec <- 
+  boost_tree(trees = 1000,
+             tree_depth = tune(),
+             min_n = tune(),
+             mtry = tune(),
+             sample_size = tune(),
+             learn_rate = tune(),
+             loss_reduction = tune()
+             ) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_spec
+```
+
+Create a workflow
+
+```{r}
+xgb_wf <- workflow() %>% 
+  add_recipe(austin_rec) %>% 
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+Create a grid
+
+```{r}
+set.seed(567)
+
+xgb_grid <- grid_max_entropy(
+  tree_depth(range = c(5L, 15L)),
+  min_n(range = c(10L, 30L)),
+  mtry(range = c(5L, 60L)),
+  sample_size = sample_prop(range = c(0.5, 1.0)),
+  learn_rate(range = c(-2,-1 )),
+  loss_reduction(range = c(-10, -5)),
+  size = 20
+)
+
+xgb_grid
+```
+
+
+```{r}
+# We use the finetune package because it has racing methods, which throw away combinations of above parameters that do not turn out well
+
+library(finetune)
+```
+
+
+```{r}
+set.seed(678)
+doParallel::registerDoParallel()
+
+library(xgboost)
+
+xgb_rs <- 
+  tune_race_anova(xgb_wf,
+                  austin_folds,
+                  grid = xgb_grid,
+                  metrics = metric_set(rmse, rsq, mae),
+                  control = control_race(verbose_elim = TRUE))   # Tells us what have been eliminated
+
+xgb_rs
+```
+
+- tune_race_anova - is an advanced hyperparameter tuning method that uses racing methods and ANOVA  to eliminate poor-performing hyperparameter configurations early, thus focusing computational resources on the most promising configurations. 
+
+- tune_grid - performs hyperparameter tuning by evaluating all combinations of hyperparameters in a predefined grid. This method is straightforward but can be computationally expensive, especially if the grid is large.
+
+
+```{r}
+plot_race(xgb_rs)
+```
+
+The sets of parameters that do not perform well are removed earlier.
+Only the last two models run to completion
+
+```{r}
+xgb_rs %>% collect_metrics()
+
+show_best(xgb_rs, metric = "rmse")
+
+```
+
+- An RMSE of 0.1180378 indicates that, on average, the predictions differ from the actual log-transformed prices by about 0.118.
+- MAE measures the average absolute difference between predicted and actual values. An MAE of 0.07135576 means that, on average, the absolute error in the log-transformed prices is 0.071.
+- An R² of 0.74673270 indicates that approximately 74.67% of the variance in the log-transformed prices is explained by the model.
+
+```{r}
+# Finalize the model
+
+xgb_final <- xgb_wf %>% 
+  finalize_workflow(select_best(xgb_rs, metric = "rmse"))
+
+xgb_final
+```
+
+```{r}
+# Fit final model on the splits
+
+austin_fit <- last_fit(xgb_final, austin_splits)
+
+austin_fit
+```
+
+```{r}
+austin_fit %>% collect_metrics()
+```
+
+- An RMSE of 0.1350454 on the test data means that, on average, the predictions differ from the actual log-transformed prices by about 0.135. In terms of back transformation, exp(0.1350454) = 1.144, indicating that the predictions are off by about 14.4% on average.
+
+- An R² value of 0.7006197 means that about 70.06% of the variance in the log-transformed prices is explained by the model on the test data.
+
+```{r}
+# Collect predictions
+
+austin_fit %>% 
+  collect_predictions() %>% 
+  ggplot(aes(latestPrice, .pred)) +
+  geom_point(alpha = 0.2) +
+  geom_abline(color = "red") +
+  coord_obs_pred()
+```
+
+There are a few over predicted values in the above plot
+
+```{r}
+over_preds <- austin_fit %>% 
+  collect_predictions() %>% 
+  mutate(residuals = latestPrice - .pred) %>% 
+  arrange(desc(abs(residuals))) %>% 
+  slice_head( n = 10)
+
+over_preds
+
+austin %>% 
+  filter(row_number() %in% over_preds$.row) %>% 
+  select(zipcode, latitude, longitude, yearBuilt, parkingSpaces, latestPrice)
+```
+
+
+```{r}
+# Check the variable importance
+
+library(vip)
+
+extract_workflow(austin_fit) %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features = 10, geom = "col")
+
+```
+
+```{r}
+# Deploying the model
+library(vetiver)
+
+austin_deploy <- extract_workflow(austin_fit) %>%
+  vetiver_model("austin_xgb")
+
+austin_deploy
+```
+
+
+
+
+
+
+
+
+
