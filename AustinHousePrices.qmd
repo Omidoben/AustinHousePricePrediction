@@ -1,0 +1,429 @@
+---
+title: "Austin House Prices Prediction"
+format: html
+editor: visual
+---
+
+## Objective
+
+Build a model that predicts the latest Price of a house based on features such as location of the house, features of the house and proximity to infrastructures such as schools
+
+```{r, message=FALSE, warning=FALSE}
+# Load libraries
+library(tidyverse)
+library(caret)
+library(keras)
+library(tensorflow)
+```
+
+```{r, message=FALSE}
+# Load data
+
+austin <- vroom::vroom("austinHousingData.csv")
+glimpse(austin)
+
+# The data set has 15,171 rows and 45 columns
+```
+
+## Exploratory analysis
+
+**Select relevant columns to be used in the analysis**
+
+Following features are dropped:
+
+-   zpid - it's just an identifier
+
+-   numOfPhotos - not relevant to house value prediction
+
+-   zipcode - since we have latitude/longitude, this is redundant
+
+-   numOfElementarySchools, numOfPrimarySchools, numOfMiddleSchools, numOfHighSchools are probably overlapping and can be captured by the average school metrics
+
+These features were dropped after performing variable importance on an initial XGBoost model, they were found to add no significant value to the model performance.
+
+```{r}
+austin_df <- austin %>% 
+  select(latitude, longitude, propertyTaxRate, livingAreaSqFt, lotSizeSqFt, yearBuilt,  numOfBathrooms, numOfBedrooms, numOfAppliances, numOfStories, parkingSpaces, numOfParkingFeatures, avgSchoolDistance, avgSchoolRating, MedianStudentsPerTeacher, homeType, latestPrice)
+
+glimpse(austin_df)
+
+# Garage spaces is removed because it is a duplicate of the parking space column
+```
+
+**Missing values**
+
+```{r}
+colSums(is.na(austin_df))     # The data has no missing values
+```
+
+**What's the average and median house prices?**
+
+```{r}
+austin_df %>% 
+  summarize(avg_house_price = mean(latestPrice),
+            median_price = median(latestPrice))   # The average price of a house in Austin = 512,768 where as the median price = 405,000
+
+summary(austin_df$latestPrice)   
+```
+
+The higher mean relative to the median indicates a right-skewed distribution, which may be influenced by luxury properties
+
+```{r}
+# Investigating the property priced at $5500 and those priced below $10000
+austin_df %>% 
+  filter(latestPrice == 5500)
+
+austin_df %>% 
+  filter(latestPrice <= 10000)  
+```
+
+Both houses seem to have similar characteristics. 10 houses are valued at \$10000 and below
+
+```{r}
+austin_df %>% 
+  filter(latestPrice >= 1000000) 
+```
+
+953 houses are priced 1,000,000 and above, thus the 13,500,000 as the highest price may not be an anomaly
+
+**Distribution of House Prices**
+
+```{r}
+austin_df %>% 
+  ggplot(aes(latestPrice)) +
+  geom_histogram(bins = 50, color = "white", fill = "midnightblue") +
+  scale_x_log10(labels = scales::dollar_format()) +
+  labs(x = "Latest Price", y = "Frequency", title = "Distribution of House Prices") +
+  theme_minimal()+
+  theme(axis.text = element_text(color = "black"),
+        plot.title = element_text(colour = "black", face = "bold"))
+```
+
+The histogram shows that indeed the house prices are right skewed, with a considerable number of high-value properties extending the right tail of the distribution.
+
+The log transformation is thus used to normalize the heavily right-skewed price distribution, making patterns in the data more interpretable.
+
+Majority of the houses in Austin are priced between \$400,000 - \$600,000.
+
+**Distribution of House Price By location (latitude & longitude)**
+
+```{r}
+price_plot <- austin_df %>% 
+  ggplot(aes(latitude, longitude, z = log(latestPrice))) +
+  stat_summary_hex(alpha = 0.8, bins = 40) +
+  scale_fill_viridis_c() +
+  labs(fill = "mean", title = "Price") +
+  theme(axis.text = element_text(color = "black"),
+        plot.title = element_text(colour = "black", face = "bold"))
+
+price_plot
+```
+
+The central areas of Austin show higher mean log-transformed house prices, as indicated by brighter colors on the map. This suggests that actual house prices are significantly higher in the city center. For instance, if the mean log price in these areas is around 4, this corresponds to an actual price of approximately exp(4) = 54.60.
+
+Areas farther from the city center exhibit lower mean log-transformed house prices, shown by darker colors.
+
+**Distribution of houses by year built, lot size, and average school ratings**
+
+```{r}
+library(patchwork)
+
+austin_plot <- function(var, title){
+  austin_df %>% 
+    ggplot(aes(latitude, longitude, z = {{var}})) +
+    stat_summary_hex(alpha = 0.8, bins = 40) +
+    scale_fill_viridis_c() +
+    labs(fill = "mean", title = title) +
+    theme(axis.text = element_text(color = "black"),
+          plot.title = element_text(colour = "black", face = "bold"))
+}
+
+(austin_plot(yearBuilt, "Year Built") +
+  austin_plot(log10(lotSizeSqFt), "Lot Size (log)")) / austin_plot(avgSchoolRating, "Average School Rating")
+```
+
+Majority of the recent houses and those with large lot sizes are farther away from the center of the city.
+
+Houses located around the center of the city have schools with higher ratings compared to those further away from the center.
+
+### Model
+
+```{r}
+# First check for correlation
+
+numeric_vars <- austin_df %>% 
+  select(where(is.numeric), -latestPrice)
+
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+
+# Correlation threshold
+cor_threshold <- 0.85
+high_cor_pairs <- which(abs(cor_matrix) > cor_threshold, arr.ind = TRUE)
+high_cor_pairs <- high_cor_pairs[high_cor_pairs[, 1] != high_cor_pairs[, 2], ]
+
+high_cor_df <- data.frame(
+  Feature1 = rownames(cor_matrix)[high_cor_pairs[, 1]],
+  Feature2 = colnames(cor_matrix)[high_cor_pairs[, 2]],
+  Correlation = cor_matrix[high_cor_pairs]
+)
+
+high_cor_df
+
+# There are no highly correlated features at a 0.85 threshold
+```
+
+**Data Preparation**
+
+```{r}
+# Log transform the target variable
+austin_df$log_price <- log(austin_df$latestPrice)
+```
+
+```{r}
+austin_df <- austin_df %>% 
+  select(-latestPrice)
+
+```
+
+**Data Preprocessing - Recipe**
+
+```{r, message=FALSE, warning=FALSE}
+
+library(tidymodels)
+# Recipe
+austin_rec <- recipe(log_price ~ ., data = austin_df) %>%
+  step_zv(all_predictors()) %>% 
+  step_corr(all_numeric_predictors(), threshold = 0.8) %>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>%
+  step_normalize(all_numeric_predictors())
+
+
+austin_prepped <- prep(austin_rec)
+preprocessed_data <- bake(austin_prepped, new_data = NULL)
+
+preprocessed_data
+
+```
+
+Split data into train and test sets
+
+```{r}
+set.seed(0213)
+
+train_index <- sample(1:nrow(preprocessed_data), 0.8 * nrow(preprocessed_data))
+test_index <- setdiff(1:nrow(preprocessed_data), train_index)
+
+# Create training and test sets
+X_train <- preprocessed_data[train_index, ] %>% select(-log_price)
+y_train <- preprocessed_data[train_index, "log_price"]
+X_test <- preprocessed_data[test_index, ] %>% select(-log_price)
+y_test <- preprocessed_data[test_index, "log_price"]
+
+
+# Convert to matrices
+X_train <- as.matrix(X_train)
+X_test <- as.matrix(X_test)
+y_train <- as.matrix(y_train)
+y_test <- as.matrix(y_test)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Input layer
+inputs <- layer_input(shape = ncol(X_train))
+```
+
+**Base Model**
+
+```{r}
+outputs_1 <- inputs %>% 
+  layer_dense(1)
+
+model_1 <- keras_model(
+  inputs = inputs,
+  outputs = outputs_1
+)
+
+# Compile model
+model_1 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "mean_squared_error",
+  metrics = c('mae')
+)
+
+
+history_1 <- model_1 %>% fit(
+  x = list(
+    X_train
+  ),
+  y = y_train,
+  epochs = 50,
+  batch_size = 128,
+  validation_split = 0.2,
+  verbose = FALSE)
+
+history_1
+plot(history_1)
+```
+
+**Model Performance:**
+
+-   Training Loss: Reduced steadily from 87.14 to 75.91 over the last 10 epochs.
+-   Validation Loss: Decreased from 86.87 to 75.63, indicating improved model fit.
+-   Validation MAE: Started at 9.31 and decreased to 8.68, showing the model's predictions are improving in terms of absolute deviation from actual values.
+
+**Performance Insights**
+
+-   Both training and validation loss, as well as MAE, decreased over the last 10 epochs. This indicates that the model is learning to minimize the prediction error during training.
+
+-   The gap between training and validation metrics is minimal, suggesting the model is slightly overfitting to the training data. Both sets of metrics improve at a similar rate, which is a positive sign for generalization.
+
+-   While the metrics have improved, an MAE of \~8.68 on the validation set indicates that the model's predictions are off by an average of approximately exp(8.68) = 5,885 (since the target variable is in log scale). This suggests that the base model has room for improvement
+
+**Adding layers to the model**
+
+Model 2
+
+```{r}
+outputs_2 <- inputs %>% 
+  layer_dense(128, activation = "relu") %>%
+  layer_dense(64, activation = "relu") %>%
+  layer_dense(32, activation = "relu") %>% 
+  layer_dense(1)
+
+# Create model
+model_2 <- keras_model(
+  inputs = inputs,
+  outputs = outputs_2
+)
+
+# Compile model
+model_2 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "mean_squared_error",
+  metrics = c('mae')
+)
+
+history_2 <- model_2 %>% fit(
+  x = list(
+    X_train
+  ),
+  y = y_train,
+  epochs = 100,
+  batch_size = 128,
+  validation_split = 0.3,
+  verbose = FALSE
+)
+
+history_2
+
+x1 <- history_2$metrics$val_loss
+plot(x1[-(1:5)], type = "o")
+```
+
+The second model shows signs of overfitting, as evidenced by the differences between the training and validation metrics. After 100 epochs:
+
+-   Training Loss: 0.07081
+-   Validation Loss: 0.183
+-   Training MAE: 0.1725
+-   Validation MAE: 0.2234
+
+These results indicate that the model performs significantly better on the training data compared to the validation data, suggesting it is learning patterns specific to the training set rather than generalizable features.
+
+To address the overfitting issue, a third model was fitted with further adjustments to the architecture and training process.
+
+**Add dropout to handle over fitting and early stopping which interrupts training once validation metrics stop improving**
+
+Model 3
+
+```{r}
+outputs_3 <- inputs %>% 
+    layer_dense(128, activation = "relu") %>%
+    layer_dropout(0.05) %>%
+    layer_dense(64, activation = "relu") %>%
+    layer_dropout(0.05) %>%
+    layer_dense(32, activation = "relu") %>%
+    layer_dropout(0.05) %>%
+    layer_dense(1)
+
+# Create model
+model_3 <- keras_model(
+  inputs = inputs,
+  outputs = outputs_3
+)
+
+# Compile model
+model_3 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "mean_squared_error",
+  metrics = c('mae')
+)
+
+# Early stopping
+early_stopping <- callback_early_stopping(
+  monitor = 'val_loss', 
+  patience = 10,
+  restore_best_weights = TRUE
+)
+
+history_3 <- model_3 %>% fit(
+  x = list(
+    X_train
+  ),
+  y = y_train,
+  epochs = 150,
+  batch_size = 128,
+  validation_split = 0.3,
+  callbacks = list(early_stopping),
+  verbose = FALSE
+)
+
+history_3
+
+# The validation loss for the first few epochs is dramatically higher than the values that follow.  Let’s omit the first 5 data points, which are on a different scale than the rest of the curve
+
+plot(history_3$metrics$val_loss)
+x <- history_3$metrics$val_loss
+plot(x[-(1:5)], type = "o")
+```
+
+Model Metrics
+
+-   Training Loss: 0.2014
+-   Training MAE: 0.3336
+-   Validation Loss: 0.1171
+-   Validation MAE: 0.2017
+
+Interpretation of Results
+
+The model demonstrates balanced performance between training and validation sets. The validation metrics (Loss: 0.1171, MAE: 0.2017) are close to the training metrics (Loss: 0.2014, MAE: 0.3336), indicating good generalization with little overfitting.
+
+Since we used log-transformed prices, we can convert the validation MAE of 0.2017 to a percentage error: (exp(0.2017) - 1) × 100% = 22.34%
+
+This means that, on average, the model's predictions deviate from the actual house prices by approximately 22.34% in either direction.
+
+To put this in perspective: - For a \$200,000 house: potential error of \$44,680 - For a \$500,000 house: potential error of \$111,700
+
+Given the wide range of house prices in the Austin market (min = \$5,500, max = \$13,500,000), a 22.34% average error represents reasonable performance, though there might be room for improvement through: - Feature engineering - Hyperparameter tuning - Architecture modifications
+
+```{r}
+# Evaluate on test set
+evaluation <- model_3 %>% evaluate(
+  x = X_test,
+  y = y_test
+)
+
+evaluation
+```
+
+Test Set Metrics
+
+Test Loss: 0.1284 Test MAE: 0.2065
+
+The test loss (0.1284) is close to both the training loss (0.2014) and validation loss (0.1171), which is a strong indication that the model is generalizing well. This consistency across all three datasets suggests the model has achieved a good balance between fitting the training data and maintaining predictive power on unseen data.
+
+The test set MAE of 0.2065, converted to a percentage error: (exp(0.2065) - 1) × 100% = 22.94%
+
+This means that, on average, the model's predictions on unseen data deviate from the true house prices by approximately 22.94% in either direction.
+
+Examples: - For a \$200,000 house: potential error of \$45,880 - For a \$500,000 house: potential error of \$114,700
